@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Advanced Data Collection App</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 0; padding: 0; background:#fafafa; }
+  header { background: #004080; color: white; padding: 10px 20px; text-align: center; }
+  h1 { margin: 0; font-weight: normal; }
+  #container { display: flex; height: calc(100vh - 60px); }
+  #grid-container { flex: 3; padding: 10px; overflow: auto; }
+  #dashboard { flex: 1; background: white; border-left: 1px solid #ccc; padding: 20px; overflow-y: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 5px; text-align: left; }
+  th { background: #0077cc; color: white; position: sticky; top: 0; }
+  td.invalid { background: #ffd6d6; }
+  td.ambiguous { background: #fff2cc; }
+  td.valid { background: white; }
+  input, select { width: 100%; box-sizing: border-box; border: none; padding: 4px; font-size: 14px; }
+  input:focus, select:focus { outline: 2px solid #0077cc; }
+  #master-upload { margin-bottom: 10px; }
+  button { margin: 5px 0; padding: 8px 12px; font-size: 14px; cursor: pointer; }
+  #stats p { margin: 5px 0; }
+  #error-list { font-size: 0.9em; max-height: 300px; overflow-y: auto; border-top: 1px solid #ccc; padding-top: 10px; }
+  #error-list div { margin-bottom: 10px; }
+  #error-list strong { color: #d00; }
+  #footer { text-align: center; padding: 8px; font-size: 12px; color: #666; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Advanced Data Collection</h1>
+</header>
+<div id="container">
+  <div id="grid-container">
+    <input type="file" id="master-upload" accept=".csv,.xlsx,.xls" />
+    <button id="download-excel">Download Excel (.xlsx)</button>
+    <button id="download-csv">Download CSV</button>
+    <p><em>Upload your master data file with canonical values and variations in the prescribed format. Then enter or paste your data below.</em></p>
+    <table id="data-table" tabindex="0" aria-label="Data Entry Table">
+      <thead>
+        <tr>
+          <th>Full Name*</th>
+          <th>Email*</th>
+          <th>Mobile*</th>
+          <th>Group*</th>
+          <th>Designation*</th>
+          <th>Gender*</th>
+          <th>Category*</th>
+          <th>DOB*</th>
+          <th>Mother Tongue*</th>
+          <th>Employee ID*</th>
+          <th>PIN</th>
+          <th>External ID</th>
+          <th>External Name</th>
+          <th>Tags</th>
+        </tr>
+      </thead>
+      <tbody id="table-body">
+        <!-- Rows will be dynamically inserted here -->
+      </tbody>
+    </table>
+  </div>
+  <div id="dashboard" aria-live="polite" aria-label="Progress and error dashboard">
+    <h2>Progress Dashboard</h2>
+    <div id="stats">
+      <p>Total Rows: <span id="total-rows">0</span></p>
+      <p>✅ Valid Rows: <span id="valid-rows">0</span></p>
+      <p>❌ Rows with Errors: <span id="error-rows">0</span></p>
+    </div>
+    <h3>Errors</h3>
+    <div id="error-list" role="list"></div>
+  </div>
+</div>
+<div id="footer">
+  &copy; 2025 Advanced Data Collection App
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script>
+// App state
+const colDefs = [
+  { key: 'fullName', required: true, validate: validateFullName },
+  { key: 'email', required: true, validate: validateEmail },
+  { key: 'mobile', required: true, validate: validateMobile },
+  { key: 'group', required: true, validate: validateMasterField },
+  { key: 'designation', required: true, validate: validateMasterField },
+  { key: 'gender', required: true, validate: validateMasterField },
+  { key: 'category', required: true, validate: validateMasterField },
+  { key: 'dob', required: true, validate: validateDOB },
+  { key: 'motherTongue', required: true, validate: validateMasterField },
+  { key: 'employeeID', required: true, validate: validateEmployeeID },
+  { key: 'pin', required: false, validate: validatePIN },
+  { key: 'externalID', required: false, validate: null },
+  { key: 'externalName', required: false, validate: null },
+  { key: 'tags', required: false, validate: null }
+];
+
+// Master data stores by field
+let masterData = {
+  group: { canonList: [], variationMap: {}, canonicalSet: new Set() },
+  designation: { canonList: [], variationMap: {}, canonicalSet: new Set() },
+  gender: { canonList: [], variationMap: {}, canonicalSet: new Set() },
+  category: { canonList: [], variationMap: {}, canonicalSet: new Set() },
+  motherTongue: { canonList: [], variationMap: {}, canonicalSet: new Set() }
+};
+
+// Abbreviation memory map (persistent in localStorage)
+let abbreviationMemory = JSON.parse(localStorage.getItem('abbrMemory') || '{}');
+
+// Data rows array of objects
+let dataRows = [];
+
+const tableBody = document.getElementById('table-body');
+const totalRowsSpan = document.getElementById('total-rows');
+const validRowsSpan = document.getElementById('valid-rows');
+const errorRowsSpan = document.getElementById('error-rows');
+const errorListDiv = document.getElementById('error-list');
+
+const masterUploadInput = document.getElementById('master-upload');
+
+const downloadExcelBtn = document.getElementById('download-excel');
+const downloadCsvBtn = document.getElementById('download-csv');
+
+// Initialize with some empty rows (20 to start)
+for(let i = 0; i < 20; i++) {
+  dataRows.push(makeEmptyRow());
+}
+renderTableRows();
+
+// Make an empty data row object
+function makeEmptyRow() {
+  let obj = {};
+  colDefs.forEach(c => obj[c.key] = '');
+  return obj;
+}
+
+function renderTableRows() {
+  tableBody.innerHTML = '';
+  dataRows.forEach((row, idx) => {
+    const tr = document.createElement('tr');
+    colDefs.forEach(c => {
+      const td = document.createElement('td');
+      td.tabIndex = 0;
+      const input = c.key === 'category' || c.key === 'designation' || c.key === 'group' || c.key === 'gender' || c.key === 'motherTongue' ? document.createElement('select') : document.createElement('input');
+      input.type = 'text';
+      input.value = row[c.key];
+      input.dataset.row = idx;
+      input.dataset.col = c.key;
+      if(c.key === 'dob') input.placeholder = 'DD-MM-YYYY';
+      input.autocomplete = 'off';
+
+      if(input.tagName === 'SELECT') {
+        // set options dynamically later
+      }
+      input.addEventListener('input', onCellInput);
+      input.addEventListener('blur', onCellBlur);
+      input.addEventListener('paste', onCellPaste);
+      td.appendChild(input);
+      tr.appendChild(td);
+    });
+    tableBody.appendChild(tr);
+  });
+  applyMasterDataToDropdowns();
+  updateDashboard();
+}
+
+function applyMasterDataToDropdowns() {
+  // For select inputs wipe and repopulate options
+  ['group','designation','gender','category','motherTongue'].forEach(field => {
+    const selects = document.querySelectorAll(`select[data-col="${field}"]`);
+    selects.forEach(sel => {
+      // Clear options
+      sel.innerHTML = '';
+      // Add empty option to allow blank
+      const emptyOpt = document.createElement('option');
+      emptyOpt.value = '';
+      emptyOpt.textContent = '';
+      sel.appendChild(emptyOpt);
+      masterData[field].canonList.forEach(optval => {
+        const option = document.createElement('option');
+        option.value = optval;
+        option.textContent = optval;
+        sel.appendChild(option);
+      });
+      // Set current value if matches canonical or abbreviation memory mapping
+      const idx = +sel.dataset.row;
+      let val = dataRows[idx][field];
+      if(abbreviationMemory[val?.toLowerCase()]) {
+        val = abbreviationMemory[val.toLowerCase()];
+        sel.value = val;
+        dataRows[idx][field] = val;
+      } else {
+        sel.value = val;
+      }
+    });
+  });
+}
+
+function onCellInput(e) {
+  const input = e.target;
+  const rowIndex = Number(input.dataset.row);
+  const colKey = input.dataset.col;
+  
+  const val = input.value;
+  dataRows[rowIndex][colKey] = val;
+
+  validateCell(rowIndex, colKey, input);
+  updateDashboard();
+}
+
+function onCellBlur(e) {
+  // For abbreviation memory training - if field is master-linked and multiple suggestions exist, store user choice
+  const input = e.target;
+  const rowIndex = Number(input.dataset.row);
+  const colKey = input.dataset.col;
+  if(!['group','designation','gender','category','motherTongue'].includes(colKey)) return;
+  // Save abbreviation memory only if selected from dropdown with canonical match
+  const val = dataRows[rowIndex][colKey];
+  if(val) {
+    abbreviationMemory[val.toLowerCase()] = val;
+    localStorage.setItem('abbrMemory', JSON.stringify(abbreviationMemory));
+  }
+}
+
+function onCellPaste(e) {
+  // Allow bulk paste, then re-validate
+  setTimeout(() => {
+    const input = e.target;
+    const rowIndex = Number(input.dataset.row);
+    const colKey = input.dataset.col;
+    const val = input.value;
+    dataRows[rowIndex][colKey] = val;
+    validateCell(rowIndex, colKey, input);
+    updateDashboard();
+  }, 50);
+}
+
+function validateCell(rowIndex, colKey, input) {
+  const val = dataRows[rowIndex][colKey];
+  input.classList.remove('invalid', 'ambiguous');
+  input.title = '';
+  let colDef = colDefs.find(c => c.key === colKey);
+  if(!colDef) return;
+
+  // For required fields empty is error
+  if(colDef.required && (!val || val.trim() === '')) {
+    markInvalid(input, 'Required field');
+    return;
+  }
+  // Validation functions
+  if(colDef.validate) {
+    const validateResult = colDef.validate(val, colKey);
+    if(validateResult.error) {
+      markInvalid(input, validateResult.message);
+    } else if(validateResult.ambiguous) {
+      markAmbiguous(input, validateResult.message);
+    } else if(validateResult.corrected) {
+      input.value = validateResult.corrected.trim();
+      dataRows[rowIndex][colKey] = input.value;
+      clearMark(input);
+    } else {
+      clearMark(input);
+    }
+  }
+  else {
+    // No validator = clear marks
+    clearMark(input);
+  }
+}
+
+function markInvalid(el, msg) {
+  el.classList.add('invalid');
+  el.classList.remove('ambiguous');
+  el.title = msg;
+}
+function markAmbiguous(el, msg) {
+  el.classList.add('ambiguous');
+  el.classList.remove('invalid');
+  el.title = msg;
+}
+function clearMark(el) {
+  el.classList.remove('invalid', 'ambiguous');
+  el.title = '';
+}
+
+// Validation functions
+function validateFullName(val) {
+  if(!val) return {error: true, message:"Required"};
+  return {};
+}
+
+function validateEmail(val) {
+  const email = val?.trim().toLowerCase();
+  if(!email) return {error: true, message:"Required"};
+  const emailFixed = fixEmailDomain(email);
+  const valid = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(emailFixed);
+  if(!valid) return {error: true, message:"Invalid email"};
+  if(email !== emailFixed) return {corrected: emailFixed};
+  return {};
+}
+
+function fixEmailDomain(email) {
+  const parts = email.split('@');
+  if(parts.length === 2) {
+    let domain = parts[1];
+    const DOMAIN_FIXES = {'gamil.com':'gmail.com','gmaill.com':'gmail.com','yaho.com':'yahoo.com',
+    'hotnail.com':'hotmail.com','hotmial.com':'hotmail.com','outlook.co':'outlook.com'};
+    if(DOMAIN_FIXES[domain]) domain = DOMAIN_FIXES[domain];
+    return parts[0]+'@'+domain;
+  }
+  return email;
+}
+
+function validateMobile(val) {
+  if(!val) return {error:true,message:'Required'};
+  let digits = val.replace(/\D/g,'');
+  if(digits.length > 10) digits = digits.slice(-10);
+  if(digits.length !== 10) return {error:true,message:'Mobile must be 10 digits'};
+  if(digits !== val) return {corrected:digits};
+  return {};
+}
+
+function validatePIN(val) {
+  if(!val) return {};
+  let digits = val.replace(/\D/g,'');
+  if(digits.length !== 6) return {error:true,message:'PIN must be 6 digits'};
+  if(digits !== val) return {corrected:digits};
+  return {};
+}
+
+function validateDOB(val) {
+  if(!val) return {error:true,message:'Required'};
+  const nd = normalizeDate(val);
+  if(!nd) return {error:true,message:'Invalid date'};
+  if(val !== nd) return {corrected:nd};
+  return {};
+}
+
+function normalizeDate(val) {
+  // Try convert to DD-MM-YYYY format
+  let d = new Date(val);
+  if(isNaN(d.getTime())) return null;
+  let dd = ('0' + d.getDate()).slice(-2);
+  let mm = ('0' + (d.getMonth()+1)).slice(-2);
+  let yyyy = d.getFullYear();
+  return `${dd}-${mm}-${yyyy}`;
+}
+
+function validateEmployeeID(val) {
+  if(!val) return {error:true,message: 'Required'};
+  let digits = val.replace(/\D/g,'');
+  if(digits.length !== 8) return {error:true, message:'Employee ID must be 8 digits'};
+  if(digits !== val) return {corrected:digits};
+  return {};
+}
+
+function validateMasterField(val, fieldKey) {
+  if(!val) return {error:true, message:'Required'};
+  const md = masterData[fieldKey];
+  if(!md) return {};
+  const valNorm = val.trim().toLowerCase();
+  // Check exact canonical or variation match:
+  if(md.canonicalSet.has(val.trim())) return {};
+  if(md.variationMap[valNorm]) return {};
+  
+  // Fuzzy match attempt to find:
+  const matches = findMasterMatches(val, md);
+  if(matches.length === 0) return {error:true,message:'Not found in master list'};
+  if(matches.length === 1) {
+    const corrected = matches[0];
+    abbreviationMemory[valNorm] = corrected;
+    localStorage.setItem('abbrMemory', JSON.stringify(abbreviationMemory));
+    return {corrected: corrected};
+  }
+  return {ambiguous: true, message: 'Multiple suggestions, please select from dropdown'};
+}
+
+function findMasterMatches(input, md) {
+  const norm = input.trim().toLowerCase();
+  const candidates = [];
+  if(md.canonicalSet.has(input.trim())) candidates.push(input.trim());
+  if(md.variationMap[norm]) candidates.push(md.variationMap[norm]);
+  for(let c of md.canonList) {
+    if(c.toLowerCase().includes(norm) || norm.includes(c.toLowerCase())) candidates.push(c);
+  }
+  return [...new Set(candidates)];
+}
+
+// Update dashboard stats and error list
+function updateDashboard() {
+  const total = dataRows.length;
+  let validCount = 0;
+  let errorCount = 0;
+  errorListDiv.innerHTML = '';
+  dataRows.forEach((row, idx) => {
+    let rowErrors = [];
+    colDefs.forEach(c => {
+      const inputEl = getInputElement(idx, c.key);
+      if(inputEl && inputEl.classList.contains('invalid')) {
+        rowErrors.push(`${columnHeader(c.key)}: ${inputEl.title}`);
+      }
+    });
+    if(rowErrors.length > 0) {
+      errorCount++;
+      const div = document.createElement('div');
+      div.innerHTML = `<strong>Row ${idx+1} Errors:</strong><br>${rowErrors.join('<br>')}`;
+      errorListDiv.appendChild(div);
+    } else {
+      validCount++;
+    }
+  });
+  totalRowsSpan.textContent = total;
+  validRowsSpan.textContent = validCount;
+  errorRowsSpan.textContent = errorCount;
+}
+
+function columnHeader(key) {
+  switch(key) {
+    case 'fullName': return 'Full Name';
+    case 'email': return 'Email';
+    case 'mobile': return 'Mobile';
+    case 'group': return 'Group';
+    case 'designation': return 'Designation';
+    case 'gender': return 'Gender';
+    case 'category': return 'Category';
+    case 'dob': return 'DOB';
+    case 'motherTongue': return 'Mother Tongue';
+    case 'employeeID': return 'Employee ID';
+    case 'pin': return 'PIN';
+    case 'externalID': return 'External ID';
+    case 'externalName': return 'External Name';
+    case 'tags': return 'Tags';
+    default: return key;
+  }
+}
+
+function getInputElement(row, colKey) {
+  return document.querySelector(`input[data-row="${row}"][data-col="${colKey}"], select[data-row="${row}"][data-col="${colKey}"]`);
+}
+
+// Master Data Upload & Parsing
+masterUploadInput.addEventListener('change', e => {
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = function(evt) {
+    let data = evt.target.result;
+    let workbook;
+    if(file.name.endsWith('.csv')) {
+      // parse csv
+      const csv = data;
+      parseMasterCSV(csv);
+    } else {
+      // parse excel
+      const uint8Array = new Uint8Array(data);
+      workbook = XLSX.read(uint8Array, {type:"array"});
+      parseMasterWorkbook(workbook);
+    }
+  };
+  if(file.name.endsWith('.csv')) {
+    reader.readAsText(file);
+  } else {
+    reader.readAsArrayBuffer(file);
+  }
+});
+
+function parseMasterCSV(csv) {
+  // Assumes CSV file structured with columns for sheets:
+  // Example CSV format: SheetName,Canonical,Variations
+  // You can adjust parsing as needed.
+  const lines = csv.split('\n');
+  const sheetData = {};
+  lines.forEach(line => {
+    const [sheetName, canonical, variation] = line.split(',').map(x => x && x.trim());
+    if(!sheetName || !canonical) return;
+    if(!sheetData[sheetName]) sheetData[sheetName] = [];
+    sheetData[sheetName].push({ canonical, variation });
+  });
+  updateMasterDataFromSheets(sheetData);
+  alert('Master data uploaded and parsed.');
+}
+
+function parseMasterWorkbook(workbook) {
+  const sheetData = {};
+  workbook.SheetNames.forEach(name => {
+    const worksheet = workbook.Sheets[name];
+    const json = XLSX.utils.sheet_to_json(worksheet, {header:1});
+    sheetData[name] = json;
+  });
+  // Transform and load
+  const structured = {};
+  for (const sheetName in sheetData) {
+    structured[sheetName] = sheetData[sheetName].slice(1).map(row => ({
+      canonical: row[0],
+      variation: row[1]
+    })).filter(r=>r.canonical);
+  }
+  updateMasterDataFromSheets(structured);
+  alert('Master data uploaded and parsed.');
+}
+
+function updateMasterDataFromSheets(sheetData) {
+  // sheetData: { Sheet2: [{canonical,variation}], Sheet3: [...], ... }
+  for(const col in MASTER_SHEET_MAP) {
+    const sheetName = MASTER_SHEET_MAP[col];
+    const records = sheetData[sheetName];
+    if(!records) continue;
+    const md = { canonList: [], variationMap: {}, canonicalSet: new Set() };
+    records.forEach(rec => {
+      const c = rec.canonical;
+      md.canonList.push(c);
+      md.canonicalSet.add(c);
+      if(rec.variation) {
+        const parts = rec.variation.split(/[,|;]/).map(x => x.trim()).filter(Boolean);
+        parts.forEach(p => md.variationMap[p.toLowerCase()] = c);
+      }
+    });
+    masterData[getFieldKey(Number(col))] = md;
+  }
+  applyMasterDataToDropdowns();
+  // Revalidate all master-linked columns in data rows
+  dataRows.forEach((_, idx) => {
+    ['group','designation','gender','category','motherTongue'].forEach(field => {
+      const input = getInputElement(idx, field);
+      if(input) validateCell(idx, field, input);
+    });
+  });
+}
+
+function getFieldKey(colNum) {
+  switch(colNum) {
+    case 4: return 'group';
+    case 5: return 'designation';
+    case 6: return 'gender';
+    case 7: return 'category';
+    case 9: return 'motherTongue';
+  }
+  return null;
+}
+
+// Download Excel (xlsx) file
+downloadExcelBtn.addEventListener('click', () => {
+  const wb = XLSX.utils.book_new();
+  const ws_data = [
+    colDefs.map(c => columnHeader(c.key))
+  ];
+  dataRows.forEach(row => {
+    ws_data.push(colDefs.map(c => row[c.key]));
+  });
+  const ws = XLSX.utils.aoa_to_sheet(ws_data);
+  XLSX.utils.book_append_sheet(wb, ws, "Data");
+  XLSX.writeFile(wb, 'CollectedData.xlsx');
+});
+
+// Download CSV file
+downloadCsvBtn.addEventListener('click', () => {
+  let csv = colDefs.map(c => `"${columnHeader(c.key)}"`).join(',') + '\n';
+  dataRows.forEach(row => {
+    const line = colDefs.map(c => `"${((row[c.key]||'').toString().replace(/"/g,'""'))}"`).join(',');
+    csv += line + '\n';
+  });
+  const blob = new Blob([csv], {type: 'text/csv;charset=utf-8;'});
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = 'CollectedData.csv';
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+});
+</script>
+</body>
+</html>
